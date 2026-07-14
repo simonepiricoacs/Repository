@@ -21,15 +21,19 @@ package it.water.repository.service;
 import it.water.core.api.bundle.Runtime;
 import it.water.core.api.entity.owned.OwnedResource;
 import it.water.core.api.entity.shared.SharedEntity;
+import it.water.core.api.entity.tenant.MultiTenantResource;
+import it.water.core.api.entity.tenant.TenantResource;
 import it.water.core.api.model.BaseEntity;
 import it.water.core.api.model.PaginableResult;
 import it.water.core.api.permission.SecurityContext;
 import it.water.core.api.registry.ComponentRegistry;
 import it.water.core.api.repository.query.Query;
+import it.water.core.api.repository.query.QueryBuilder;
 import it.water.core.api.repository.query.QueryOrder;
 import it.water.core.api.service.BaseEntityApi;
 import it.water.core.api.service.BaseEntitySystemApi;
 import it.water.core.api.service.integration.SharedEntityIntegrationClient;
+import it.water.core.api.service.integration.TenantMembershipResolver;
 import it.water.core.interceptors.annotations.Inject;
 import it.water.core.permission.action.CrudActions;
 import it.water.core.permission.annotations.AllowGenericPermissions;
@@ -46,6 +50,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.Collection;
+import java.util.List;
+import java.util.Set;
 
 
 /**
@@ -92,6 +98,15 @@ public abstract class BaseEntityServiceImpl<T extends BaseEntity> extends BaseAb
             Long ownerUserId = (runtime != null) ? runtime.getSecurityContext().getLoggedEntityId() : 0;
             ownedResource.setOwnerUserId(ownerUserId);
         }
+        //automatic setting tenancy on entity: only when a company is active on the current session
+        //(lenient rule); when no company is active the entity stays global/unassigned, preserving
+        //the single-tenant behaviour.
+        if (entity instanceof TenantResource tenantResource && runtime != null) {
+            Long activeCompanyId = runtime.getSecurityContext().getActiveCompanyId();
+            if (activeCompanyId != null) {
+                tenantResource.setCompanyId(activeCompanyId);
+            }
+        }
         return this.getSystemService().save(entity);
     }
 
@@ -111,13 +126,16 @@ public abstract class BaseEntityServiceImpl<T extends BaseEntity> extends BaseAb
             // to admins too: the generic update is not the place to transfer ownership (a dedicated
             // operation should be used for that). Note this only fixes the persisted field value; the
             // H5 ownership/permission interceptor independently reloads the entity for authorization.
-            if (entity instanceof OwnedResource ownedResource) {
-                // Restore the owner from the persisted entity when it exists; if it does not exist we
-                // leave the entity unchanged and let the system-service update surface the error,
-                // preserving the prior not-found behaviour of update().
+            // Load the persisted entity once and restore server-controlled, non-transferable fields
+            // (ownerUserId and companyId) so the client can never hijack ownership or move an entity
+            // across tenants via the generic update path. Applied to admins too.
+            if (entity instanceof OwnedResource || entity instanceof TenantResource) {
                 BaseEntity persisted = this.getSystemService().find(entity.getId());
-                if (persisted instanceof OwnedResource persistedOwned) {
+                if (entity instanceof OwnedResource ownedResource && persisted instanceof OwnedResource persistedOwned) {
                     ownedResource.setOwnerUserId(persistedOwned.getOwnerUserId());
+                }
+                if (entity instanceof TenantResource tenantResource && persisted instanceof TenantResource persistedTenant) {
+                    tenantResource.setCompanyId(persistedTenant.getCompanyId());
                 }
             }
             return this.getSystemService().update(entity);
@@ -164,6 +182,7 @@ public abstract class BaseEntityServiceImpl<T extends BaseEntity> extends BaseAb
         this.log.debug("Service Find entity {} with id {}", this.type.getSimpleName(), filter);
         SecurityContext securityContext = runtime.getSecurityContext();
         filter = this.createConditionForOwnedOrSharedResource(filter, securityContext);
+        filter = this.createConditionForTenantResource(filter, securityContext);
         return this.getSystemService().find(filter);
     }
 
@@ -180,6 +199,7 @@ public abstract class BaseEntityServiceImpl<T extends BaseEntity> extends BaseAb
         this.log.debug("Service Find all entities {} ", this.type.getSimpleName());
         SecurityContext securityContext = runtime.getSecurityContext();
         filter = this.createConditionForOwnedOrSharedResource(filter, securityContext);
+        filter = this.createConditionForTenantResource(filter, securityContext);
         return this.getSystemService().findAll(filter, delta, page, queryOrder);
     }
 
@@ -212,6 +232,86 @@ public abstract class BaseEntityServiceImpl<T extends BaseEntity> extends BaseAb
         return initialFilter;
     }
 
+    /**
+     * Builds the tenant-scoping condition for tenant-aware entities and AND-s it onto the incoming
+     * filter. This is independent of (and complementary to) the ownership/shared condition: an entity
+     * can be both an OwnedResource and a TenantResource and must satisfy BOTH.
+     * <p>
+     * Lenient rule (backward compatible): enforcement kicks in ONLY when a company is active on the
+     * current SecurityContext. When {@code getActiveCompanyId()} is null (MT off, non-scoped admin,
+     * legacy token) no condition is added and the behaviour is identical to single-tenant. There is
+     * intentionally NO {@code isAdmin()} special-casing here: admin scoping derives purely from
+     * whether a company is active.
+     *
+     * @param initialFilter   the filter accumulated so far (may be null)
+     * @param securityContext the current security context
+     * @return the (possibly AND-ed) filter
+     */
+    private Query createConditionForTenantResource(Query initialFilter, SecurityContext securityContext) {
+        if (securityContext == null)
+            return initialFilter;
+        Long activeCompanyId = securityContext.getActiveCompanyId();
+        //lenient rule: no active company => no tenant filter => behaves exactly like today
+        if (activeCompanyId == null)
+            return initialFilter;
+
+        QueryBuilder queryBuilder = getSystemService().getQueryBuilderInstance();
+        Query tenantCondition = null;
+
+        if (TenantResource.class.isAssignableFrom(this.getEntityType())) {
+            //single-company entity: visible if it belongs to the active company OR is a global
+            //(null companyId) / unassigned instance. equalTo(null) maps to an IS NULL predicate.
+            tenantCondition = queryBuilder.field(TenantResource.COMPANY_ID_FIELD_NAME).equalTo(activeCompanyId)
+                    .or(queryBuilder.field(TenantResource.COMPANY_ID_FIELD_NAME).equalTo(null));
+        } else if (MultiTenantResource.class.isAssignableFrom(this.getEntityType())) {
+            //M:N entity: scope by the set of instance ids that belong to the active company, resolved
+            //by the entity module's TenantMembershipResolver (registered in Wave B).
+            TenantMembershipResolver resolver = findTenantMembershipResolver();
+            if (resolver != null) {
+                Set<Long> ids = resolver.getEntityIdsInCompany(this.getEntityType().getName(), activeCompanyId);
+                if (ids == null || ids.isEmpty()) {
+                    //no instances belong to this company => a never-true condition => zero rows.
+                    tenantCondition = queryBuilder.field("id").equalTo(-1L);
+                } else {
+                    //NOTE: field("id").in(list) is capped at 2 operands (see createFilterForOwnedOrSharedResource);
+                    //build the IN via the string filter with server-controlled numeric ids (no injection risk).
+                    StringBuilder idsCsv = new StringBuilder();
+                    for (Long memberId : ids) {
+                        if (idsCsv.length() > 0)
+                            idsCsv.append(",");
+                        idsCsv.append(memberId.longValue());
+                    }
+                    tenantCondition = queryBuilder.createQueryFilter("id IN (" + idsCsv + ")");
+                }
+            } else {
+                //TODO(Wave B): no resolver yet for this MultiTenantResource type. Fail-open here is
+                //acceptable ONLY because the resolver ships in Wave B together with the M:N entity.
+                getLog().warn("No TenantMembershipResolver found for MultiTenantResource {}: tenant filter NOT applied", this.getEntityType().getName());
+            }
+        }
+
+        if (tenantCondition != null) {
+            initialFilter = (initialFilter == null) ? tenantCondition : initialFilter.and(tenantCondition);
+        }
+        return initialFilter;
+    }
+
+    /**
+     * Looks up the TenantMembershipResolver that supports the current entity type, if any.
+     *
+     * @return the matching resolver or null if none is registered
+     */
+    private TenantMembershipResolver findTenantMembershipResolver() {
+        List<TenantMembershipResolver> resolvers = getComponentRegistry().findComponents(TenantMembershipResolver.class, null);
+        if (resolvers != null) {
+            for (TenantMembershipResolver resolver : resolvers) {
+                if (resolver.supports(this.getEntityType().getName()))
+                    return resolver;
+            }
+        }
+        return null;
+    }
+
     protected abstract BaseEntitySystemApi<T> getSystemService();
 
     /**
@@ -237,6 +337,7 @@ public abstract class BaseEntityServiceImpl<T extends BaseEntity> extends BaseAb
         this.log.debug("Service countAll entities {}", this.type.getSimpleName());
         SecurityContext securityContext = runtime.getSecurityContext();
         filter = this.createConditionForOwnedOrSharedResource(filter, securityContext);
+        filter = this.createConditionForTenantResource(filter, securityContext);
         return this.getSystemService().countAll(filter);
     }
 

@@ -207,6 +207,13 @@ productApi.remove(saved.getId());
 | Ownership filtering | Automatic for `OwnedResource` entities | Enabled |
 | Pagination defaults | `delta` (page size), `page` (page number) | `delta=20`, `page=1` |
 
+## Multitenancy (Company-based)
+
+Tenant enforcement is centralized in the Api service layer.
+
+- `BaseEntityServiceImpl` auto-assigns `companyId` on save (`TenantResource`), ANDs a tenant condition on `find` / `findAll` / `countAll` (`companyId = active OR IS NULL` for column entities; `id IN (resolver ids)` for M:N), and restores `companyId` on update.
+- **Lenient rule**: applies ONLY when `SecurityContext.getActiveCompanyId() != null` (MT off / non-scoped admin / legacy → no filtering, backward compatible); NO `isAdmin()` special-casing (unlike the ownership filter). `SystemApi` bypasses all of it.
+
 ## Dependencies
 
 - **Core-api** — `BaseEntityApi`, `BaseEntitySystemApi`, `BaseRepository`, `QueryBuilder`

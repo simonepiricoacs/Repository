@@ -76,9 +76,9 @@ class QueryParserTest {
      */
     @Test
     void testParse_operatorMissingRhs_terminatesWithinTimeoutAndThrows() {
+        QueryParser parser = new QueryParser(FILTER_OPERATOR_MISSING_RHS);
         Assertions.assertTimeoutPreemptively(Duration.ofMillis(DOS_TIMEOUT_MS), () ->
-                Assertions.assertThrows(IllegalArgumentException.class, () ->
-                        new QueryParser(FILTER_OPERATOR_MISSING_RHS).parse(),
+                Assertions.assertThrows(IllegalArgumentException.class, parser::parse,
                         "Expected IllegalArgumentException for operator without right-hand operand"
                 )
         );
@@ -93,9 +93,9 @@ class QueryParserTest {
      */
     @Test
     void testParse_sqlInjectionUnbalancedCloseParen_terminatesWithinTimeoutAndThrows() {
+        QueryParser parser = new QueryParser(FILTER_SQL_INJECTION_UNBALANCED_PAREN);
         Assertions.assertTimeoutPreemptively(Duration.ofMillis(DOS_TIMEOUT_MS), () ->
-                Assertions.assertThrows(IllegalArgumentException.class, () ->
-                        new QueryParser(FILTER_SQL_INJECTION_UNBALANCED_PAREN).parse(),
+                Assertions.assertThrows(IllegalArgumentException.class, parser::parse,
                         "Expected IllegalArgumentException for unbalanced close-parenthesis"
                 )
         );
@@ -111,8 +111,8 @@ class QueryParserTest {
      */
     @Test
     void testParse_unclosedOpenParentheses_throwsIllegalArgumentException() {
-        Assertions.assertThrows(IllegalArgumentException.class, () ->
-                new QueryParser("((a=1").parse(),
+        QueryParser parser = new QueryParser("((a=1");
+        Assertions.assertThrows(IllegalArgumentException.class, parser::parse,
                 "Unclosed parentheses must be rejected at EOF"
         );
     }
@@ -123,8 +123,8 @@ class QueryParserTest {
      */
     @Test
     void testParse_bareCloseParen_throwsIllegalArgumentException() {
-        Assertions.assertThrows(IllegalArgumentException.class, () ->
-                new QueryParser(")").parse(),
+        QueryParser parser = new QueryParser(")");
+        Assertions.assertThrows(IllegalArgumentException.class, parser::parse,
                 "A lone ')' must be rejected as unbalanced"
         );
     }
@@ -137,8 +137,8 @@ class QueryParserTest {
      */
     @Test
     void testParse_concatenatedSymbolOperators_throwsIllegalArgumentException() {
-        Assertions.assertThrows(IllegalArgumentException.class, () ->
-                new QueryParser("a==b").parse(),
+        QueryParser parser = new QueryParser("a==b");
+        Assertions.assertThrows(IllegalArgumentException.class, parser::parse,
                 "Double-equals operator must be rejected"
         );
     }

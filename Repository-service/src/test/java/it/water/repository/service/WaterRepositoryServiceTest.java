@@ -394,11 +394,11 @@ class WaterRepositoryServiceTest implements Service {
         entity.setId(1L);
 
         localService.save(entity);
-        Mockito.verify(eventProducer).produceEvent(eq(entity), eq(PreSaveEvent.class));
-        Mockito.verify(eventProducer).produceEvent(eq(entity), eq(PostSaveEvent.class));
+        Mockito.verify(eventProducer).produceEvent(entity, PreSaveEvent.class);
+        Mockito.verify(eventProducer).produceEvent(entity, PostSaveEvent.class);
 
         localService.update(entity);
-        Mockito.verify(eventProducer).produceEvent(eq(entity), eq(PreUpdateEvent.class));
+        Mockito.verify(eventProducer).produceEvent(entity, PreUpdateEvent.class);
         Mockito.verify(eventProducer).produceDetailedEvent(any(), any(), eq(PreUpdateDetailedEvent.class));
 
         localService.remove(1L);
@@ -478,7 +478,7 @@ class WaterRepositoryServiceTest implements Service {
 
         protectedService.find((Query) null);
 
-        Mockito.verify(sharedClient).fetchSharingUsersIds(eq(TestEntity.class.getName()), eq(123L));
+        Mockito.verify(sharedClient).fetchSharingUsersIds(TestEntity.class.getName(), 123L);
 
         Mockito.when(mockSecurityContext.getLoggedEntityId()).thenReturn(0L);
         Assertions.assertThrows(UnauthorizedException.class, () -> protectedService.find((Query) null));

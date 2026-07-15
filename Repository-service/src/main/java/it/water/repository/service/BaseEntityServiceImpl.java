@@ -248,52 +248,62 @@ public abstract class BaseEntityServiceImpl<T extends BaseEntity> extends BaseAb
      * @return the (possibly AND-ed) filter
      */
     private Query createConditionForTenantResource(Query initialFilter, SecurityContext securityContext) {
-        if (securityContext == null)
+        //lenient rule: no security context or no active company => no tenant filter => behaves exactly like today
+        if (securityContext == null || securityContext.getActiveCompanyId() == null)
             return initialFilter;
-        Long activeCompanyId = securityContext.getActiveCompanyId();
-        //lenient rule: no active company => no tenant filter => behaves exactly like today
-        if (activeCompanyId == null)
+        Query tenantCondition = buildTenantCondition(securityContext.getActiveCompanyId());
+        if (tenantCondition == null)
             return initialFilter;
+        return (initialFilter == null) ? tenantCondition : initialFilter.and(tenantCondition);
+    }
 
+    /**
+     * Builds the tenant condition for the current entity type, or null if the entity is not tenant-aware
+     * (or has no resolver for the M:N case).
+     */
+    private Query buildTenantCondition(long activeCompanyId) {
         QueryBuilder queryBuilder = getSystemService().getQueryBuilderInstance();
-        Query tenantCondition = null;
-
         if (TenantResource.class.isAssignableFrom(this.getEntityType())) {
             //single-company entity: visible if it belongs to the active company OR is a global
             //(null companyId) / unassigned instance. equalTo(null) maps to an IS NULL predicate.
-            tenantCondition = queryBuilder.field(TenantResource.COMPANY_ID_FIELD_NAME).equalTo(activeCompanyId)
+            return queryBuilder.field(TenantResource.COMPANY_ID_FIELD_NAME).equalTo(activeCompanyId)
                     .or(queryBuilder.field(TenantResource.COMPANY_ID_FIELD_NAME).equalTo(null));
-        } else if (MultiTenantResource.class.isAssignableFrom(this.getEntityType())) {
-            //M:N entity: scope by the set of instance ids that belong to the active company, resolved
-            //by the entity module's TenantMembershipResolver (registered in Wave B).
-            TenantMembershipResolver resolver = findTenantMembershipResolver();
-            if (resolver != null) {
-                Set<Long> ids = resolver.getEntityIdsInCompany(this.getEntityType().getName(), activeCompanyId);
-                if (ids == null || ids.isEmpty()) {
-                    //no instances belong to this company => a never-true condition => zero rows.
-                    tenantCondition = queryBuilder.field("id").equalTo(-1L);
-                } else {
-                    //NOTE: field("id").in(list) is capped at 2 operands (see createFilterForOwnedOrSharedResource);
-                    //build the IN via the string filter with server-controlled numeric ids (no injection risk).
-                    StringBuilder idsCsv = new StringBuilder();
-                    for (Long memberId : ids) {
-                        if (idsCsv.length() > 0)
-                            idsCsv.append(",");
-                        idsCsv.append(memberId.longValue());
-                    }
-                    tenantCondition = queryBuilder.createQueryFilter("id IN (" + idsCsv + ")");
-                }
-            } else {
-                //TODO(Wave B): no resolver yet for this MultiTenantResource type. Fail-open here is
-                //acceptable ONLY because the resolver ships in Wave B together with the M:N entity.
-                getLog().warn("No TenantMembershipResolver found for MultiTenantResource {}: tenant filter NOT applied", this.getEntityType().getName());
-            }
         }
+        if (MultiTenantResource.class.isAssignableFrom(this.getEntityType())) {
+            return buildMultiTenantCondition(queryBuilder, activeCompanyId);
+        }
+        return null;
+    }
 
-        if (tenantCondition != null) {
-            initialFilter = (initialFilter == null) ? tenantCondition : initialFilter.and(tenantCondition);
+    /**
+     * M:N entity: scope by the set of instance ids that belong to the active company, resolved by the
+     * entity module's TenantMembershipResolver. Returns a never-true condition when the company has no
+     * members, or null (not tenant-filtered, logged) when no resolver is registered for the type.
+     */
+    private Query buildMultiTenantCondition(QueryBuilder queryBuilder, long activeCompanyId) {
+        TenantMembershipResolver resolver = findTenantMembershipResolver();
+        if (resolver == null) {
+            getLog().warn("No TenantMembershipResolver found for MultiTenantResource {}: tenant filter NOT applied", this.getEntityType().getName());
+            return null;
         }
-        return initialFilter;
+        Set<Long> ids = resolver.getEntityIdsInCompany(this.getEntityType().getName(), activeCompanyId);
+        if (ids == null || ids.isEmpty())
+            return queryBuilder.field("id").equalTo(-1L);
+        return queryBuilder.createQueryFilter("id IN (" + joinIds(ids) + ")");
+    }
+
+    /**
+     * Joins server-controlled numeric ids into a CSV for an IN string filter. Building the IN this way
+     * avoids the field(...).in(list) form, whose In operation is bounded to two operands.
+     */
+    private static String joinIds(Set<Long> ids) {
+        StringBuilder csv = new StringBuilder();
+        for (Long id : ids) {
+            if (csv.length() > 0)
+                csv.append(",");
+            csv.append(id.longValue());
+        }
+        return csv.toString();
     }
 
     /**
